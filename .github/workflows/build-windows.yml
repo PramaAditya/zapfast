@@ -22,6 +22,8 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Build release zapfast.exe
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin zapfast
       - name: Upload zapfast.exe artifact

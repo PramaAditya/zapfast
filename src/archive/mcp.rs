@@ -407,7 +407,7 @@ impl Archive {
              ORDER BY c.last_activity DESC
              LIMIT 1";
         self.connection
-            .query_row(params![pattern], |row| self.row_to_mcp_chat(row, true))
+            .query_row(sql, params![pattern], |row| self.row_to_mcp_chat(row, true))
             .optional()
     }
 
@@ -513,7 +513,7 @@ impl Archive {
         ";
         let row = self
             .connection
-            .query_row(params![primary, secondary], |r| {
+            .query_row(sql, params![primary, secondary], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
