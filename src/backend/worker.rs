@@ -56,6 +56,7 @@ mod interactive;
 mod link_preview;
 mod link_preview_setting;
 mod link_watch;
+mod mcp;
 mod new_group;
 mod poll_history;
 mod polls;
@@ -1082,6 +1083,8 @@ pub async fn run(
         early: Default::default(),
         link_watch: Default::default(),
         forward_queue: None,
+        mcp_sends: HashMap::new(),
+        mcp_downloads: HashMap::new(),
     };
     worker.load_state();
     worker.backfill();
@@ -1103,6 +1106,7 @@ pub async fn run(
     discard_attachment_staging(&worker.dirs.saved_sticker_dir());
     worker.start_bot().await;
     let mut wa_events = wa_events;
+    let mut mcp_inbox = mcp::spawn_server();
     let mut tick = tokio::time::interval(link_watch::CHECK_INTERVAL);
     'commands: loop {
         let deadline = worker.sync_deadline;
@@ -1161,6 +1165,9 @@ pub async fn run(
                     }
                     Some(command) => worker.handle_command(command).await,
                 }
+            }
+            Some(mcp_cmd) = mcp_inbox.recv() => {
+                worker.handle_mcp(mcp_cmd);
             }
             Some(event) = wa_events.recv() => match event {
                 RuntimeEvent::WhatsApp { session, event } => {
@@ -1662,6 +1669,8 @@ struct Worker {
     /// The devices the call screen was last handed, kept so a device that goes away can be named
     /// by the description the user saw in the picker rather than by its node name.
     call_devices: crate::calls::DeviceList,
+    mcp_sends: HashMap<ChatId, Vec<oneshot::Sender<mcp::SendMessageResponse>>>,
+    mcp_downloads: HashMap<(ChatId, String), Vec<oneshot::Sender<mcp::DownloadMediaResponse>>>,
 }
 
 /// A queued forward: where it goes, the protobuf, and its disappearing timer.
@@ -8415,23 +8424,7 @@ impl Worker {
                 });
             }
             Command::CheckForUpdates => {
-                let events = self.events.clone();
-                let waker = self.waker.clone();
-                tokio::task::spawn_blocking(move || {
-                    match crate::updates::updater().and_then(|updater| updater.check()) {
-                        Ok(Some(release)) => {
-                            let _ = events.send(Event::UpdateAvailable {
-                                version: release.version,
-                                url: release.url,
-                            });
-                            waker.wake();
-                        }
-                        Ok(None) => log::debug!("this is the newest release"),
-                        Err(error) => {
-                            log::debug!("could not check for a newer release: {error:#}")
-                        }
-                    }
-                });
+                // Disabled in custom MCP fork so upstream releases never overwrite our binary.
             }
             Command::GifResults {
                 query,
@@ -8912,6 +8905,7 @@ impl Worker {
                     });
                 }
                 if id.is_empty() {
+                    self.notify_mcp_sent(&chat, error.as_deref());
                     // This is a command failure, not a failed message send.
                     if let Some(error) = error {
                         self.emit(Event::Error(error));
@@ -8932,6 +8926,7 @@ impl Worker {
                 self.emit_message(&chat, &id);
                 self.emit_chat(&chat);
                 self.advance_serial_forward(&id);
+                self.notify_mcp_sent(&chat, error.as_deref());
                 if let Some(error) = error {
                     self.emit(Event::Error(format!("Message not sent: {error}")));
                 }
@@ -10523,6 +10518,7 @@ impl Worker {
                 .insert((chat.clone(), id.clone()));
         }
         let result_ok = result.is_ok();
+        self.notify_mcp_downloaded(&chat, &id, &result);
         self.emit(Event::Media {
             card,
             chat,
@@ -20145,6 +20141,8 @@ mod receipt_tests {
             early: Default::default(),
             link_watch: Default::default(),
             forward_queue: None,
+            mcp_sends: HashMap::new(),
+            mcp_downloads: HashMap::new(),
         };
         worker.archive.set_meta("me_pn", ME).unwrap();
         (worker, events_rx, inbox, wa_events)

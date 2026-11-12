@@ -7,16 +7,6 @@ name: CI
 # release tag. Changes to documentation alone skip the build entirely; the
 # required `policy` check lives in policy.yml so it still reports on them.
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - docs/**
-      - '**.md'
-  pull_request:
-    paths-ignore:
-      - docs/**
-      - '**.md'
-  merge_group:
   workflow_dispatch:
 
 permissions:

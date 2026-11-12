@@ -1,0 +1,31 @@
+name: Build Windows MCP Fork
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: build (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release zapfast.exe
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin zapfast
+      - name: Upload zapfast.exe artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: zapfast-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/zapfast.exe

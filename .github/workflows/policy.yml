@@ -3,10 +3,6 @@ name: Policy
 # The required check. It runs on every change, documentation included, so
 # CI's paths-ignore never leaves a pull request waiting for it.
 on:
-  push:
-    branches: [main]
-  pull_request:
-  merge_group:
   workflow_dispatch:
 
 permissions:

@@ -2,4 +2,5 @@
 # Fix new formatting or lint failures when updating this version.
 [toolchain]
 channel = "1.98.0"
+profile = "minimal"
 components = ["rustfmt", "clippy"]
