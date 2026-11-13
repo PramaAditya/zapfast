@@ -1643,7 +1643,7 @@ impl Worker {
                 } else {
                     Some(
                         self.archive
-                            .mcp_sender_name(&message.sender, message.sender_name.as_deref()),
+                            .mcp_sender_name(&message.sender, message.sender_name.clone()),
                     )
                 };
                 let mentions = message.mentions.iter().map(|m| m.id.clone()).collect();
@@ -1677,7 +1677,7 @@ impl Worker {
                 } else {
                     Some(
                         self.archive
-                            .mcp_sender_name(&message.sender, message.sender_name.as_deref()),
+                            .mcp_sender_name(&message.sender, message.sender_name.clone()),
                     )
                 };
                 let mentions = message.mentions.iter().map(|m| m.id.clone()).collect();
@@ -1734,7 +1734,7 @@ impl Worker {
                 let sender_name = Some(self.archive.mcp_sender_name(sender, None));
                 let detail = match activity {
                     Some(ChatActivity::Typing) => "typing",
-                    Some(ChatActivity::Recording) => "recording",
+                    Some(ChatActivity::RecordingAudio) => "recording",
                     None => "stopped",
                 };
                 McpSseEvent {
