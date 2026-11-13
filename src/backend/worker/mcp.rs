@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -10,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{FileSendOptions, Worker};
 use crate::archive::{McpChat, McpContact, McpMessage, McpMessageContext};
-
+use crate::paths::AppDirs;
 const DEFAULT_MCP_PORT: u16 = 47_120;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -60,14 +61,42 @@ pub(super) enum McpCommand {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct StatusResponse {
+    pub account_id: String,
+    pub active: bool,
     pub connected: bool,
     pub status: String,
     pub me_pn: Option<String>,
     pub me_name: Option<String>,
+    pub archive_path: String,
 }
 
+#[derive(Serialize)]
+struct GlobalStatusResponse {
+    pub account_id: String,
+    pub active: bool,
+    pub connected: bool,
+    pub status: String,
+    pub me_pn: Option<String>,
+    pub me_name: Option<String>,
+    pub archive_path: String,
+    pub accounts: Vec<StatusResponse>,
+}
+
+#[derive(Deserialize, Default)]
+struct AccountSelector {
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct AccountsFile {
+    #[serde(default)]
+    pub active: String,
+    #[serde(default)]
+    pub order: Vec<String>,
+}
 #[derive(Deserialize)]
 pub(super) struct ListChatsRequest {
     pub query: Option<String>,
@@ -186,45 +215,154 @@ fn default_context() -> usize {
     5
 }
 
-pub(super) fn spawn_server() -> mpsc::UnboundedReceiver<McpCommand> {
+type WorkerEntry = (String, mpsc::UnboundedSender<McpCommand>);
+
+static REGISTRY: LazyLock<Mutex<Vec<WorkerEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SERVER_INIT: OnceLock<()> = OnceLock::new();
+
+fn registry() -> &'static Mutex<Vec<WorkerEntry>> {
+    &REGISTRY
+}
+
+fn read_accounts_roster() -> (String, Vec<String>) {
+    let path = AppDirs::discover().accounts_file();
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Ok(parsed) = serde_json::from_slice::<AccountsFile>(&bytes)
+    {
+        let active = if parsed.active.is_empty() {
+            "1".to_owned()
+        } else {
+            parsed.active
+        };
+        return (active, parsed.order);
+    }
+    ("1".to_owned(), vec!["1".to_owned()])
+}
+
+fn live_workers() -> Vec<WorkerEntry> {
+    let mut guard = registry().lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|(_, tx)| !tx.is_closed());
+    guard.clone()
+}
+
+async fn collect_all_statuses() -> Vec<(StatusResponse, mpsc::UnboundedSender<McpCommand>)> {
+    let (active_id, order) = read_accounts_roster();
+    let mut entries = live_workers();
+    entries.sort_by_key(|(id, _)| order.iter().position(|o| o == id).unwrap_or(usize::MAX - 1));
+    let mut out = Vec::with_capacity(entries.len());
+    for (id, tx) in entries {
+        let (reply, rx) = oneshot::channel();
+        if tx.send(McpCommand::Status { reply }).is_ok()
+            && let Ok(mut st) = rx.await
+        {
+            st.active = id == active_id;
+            out.push((st, tx));
+        }
+    }
+    out
+}
+
+fn digits_only(s: &str) -> String {
+    let head = s.split('@').next().unwrap_or(s);
+    let head = head.split(':').next().unwrap_or(head);
+    head.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+async fn resolve_worker(
+    selector: Option<&str>,
+) -> Option<(StatusResponse, mpsc::UnboundedSender<McpCommand>)> {
+    let all = collect_all_statuses().await;
+    if all.is_empty() {
+        return None;
+    }
+    if let Some(raw) = selector.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(found) = all.iter().find(|(st, _)| st.account_id == raw) {
+            return Some(found.clone());
+        }
+        let needle_digits = digits_only(raw);
+        if !needle_digits.is_empty()
+            && let Some(found) = all.iter().find(|(st, _)| {
+                st.me_pn.as_deref().map(digits_only).is_some_and(|d| {
+                    !d.is_empty() && (d == needle_digits || d.ends_with(&needle_digits))
+                })
+            })
+        {
+            return Some(found.clone());
+        }
+        let lower = raw.to_ascii_lowercase();
+        if let Some(found) = all.iter().find(|(st, _)| {
+            st.me_name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains(&lower))
+        }) {
+            return Some(found.clone());
+        }
+        return None;
+    }
+    if let Some(active) = all.iter().find(|(st, _)| st.active && st.connected) {
+        return Some(active.clone());
+    }
+    if let Some(active) = all.iter().find(|(st, _)| st.active) {
+        return Some(active.clone());
+    }
+    if let Some(connected) = all.iter().find(|(st, _)| st.connected) {
+        return Some(connected.clone());
+    }
+    all.into_iter().next()
+}
+
+pub(super) fn spawn_server(account_id: String) -> mpsc::UnboundedReceiver<McpCommand> {
     let (tx, rx) = mpsc::unbounded_channel();
+    {
+        let mut guard = registry().lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(id, sender)| id != &account_id && !sender.is_closed());
+        guard.push((account_id, tx));
+    }
     #[cfg(test)]
     if std::env::var_os("ZAPFAST_MCP_PORT").is_none() {
         return rx;
     }
-    let port = std::env::var("ZAPFAST_MCP_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_MCP_PORT);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(addr).await {
-            Ok(listener) => {
-                log::info!("MCP localhost bridge listening on http://{addr}");
-                listener
-            }
-            Err(error) => {
-                log::warn!("MCP localhost bridge could not bind {addr}: {error}");
-                return;
-            }
-        };
-        loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
-            };
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let _ = handle_connection(stream, tx).await;
+    SERVER_INIT.get_or_init(|| {
+        let port = std::env::var("ZAPFAST_MCP_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_MCP_PORT);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let _ = std::thread::Builder::new()
+            .name("zapfast-mcp-http".to_owned())
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async move {
+                    let listener = match TcpListener::bind(addr).await {
+                        Ok(listener) => {
+                            log::info!("MCP localhost bridge listening on http://{addr}");
+                            listener
+                        }
+                        Err(error) => {
+                            log::warn!("MCP localhost bridge could not bind {addr}: {error}");
+                            return;
+                        }
+                    };
+                    loop {
+                        let Ok((stream, _peer)) = listener.accept().await else {
+                            continue;
+                        };
+                        tokio::spawn(async move {
+                            let _ = handle_connection(stream).await;
+                        });
+                    }
+                });
             });
-        }
     });
     rx
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    tx: mpsc::UnboundedSender<McpCommand>,
-) -> std::io::Result<()> {
+async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).await? == 0 {
@@ -254,7 +392,7 @@ async fn handle_connection(
     }
     let mut stream = reader.into_inner();
 
-    let (status, payload) = route_request(method, path, &body, &tx).await;
+    let (status, payload) = route_request(method, path, &body).await;
     let status_text = match status {
         200 => "200 OK",
         400 => "400 Bad Request",
@@ -287,27 +425,70 @@ fn json_ok<T: Serialize>(value: &T) -> (u16, Vec<u8>) {
     }
 }
 
-async fn route_request(
-    method: &str,
-    path: &str,
-    body: &[u8],
-    tx: &mpsc::UnboundedSender<McpCommand>,
-) -> (u16, Vec<u8>) {
-    if method == "GET" && (path == "/api/status" || path == "/health") {
-        let (reply, rx) = oneshot::channel();
-        if tx.send(McpCommand::Status { reply }).is_err() {
-            return json_error(500, "Worker unavailable");
+fn query_account_param(raw_path: &str) -> (&str, Option<String>) {
+    let Some((base, query)) = raw_path.split_once('?') else {
+        return (raw_path, None);
+    };
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "account"
+            && !v.is_empty()
+        {
+            return (base, Some(v.to_owned()));
         }
-        return match rx.await {
-            Ok(res) => json_ok(&res),
-            Err(_) => json_error(500, "Worker dropped request"),
+    }
+    (base, None)
+}
+
+async fn route_request(method: &str, raw_path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let (path, query_acct) = query_account_param(raw_path);
+    let body_acct = if !body.is_empty() {
+        serde_json::from_slice::<AccountSelector>(body)
+            .ok()
+            .and_then(|s| s.account)
+    } else {
+        None
+    };
+    let selector = body_acct.as_deref().or(query_acct.as_deref());
+
+    if (method == "GET" || method == "POST") && path == "/api/accounts" {
+        let all: Vec<StatusResponse> = collect_all_statuses()
+            .await
+            .into_iter()
+            .map(|(st, _)| st)
+            .collect();
+        return json_ok(&all);
+    }
+
+    if (method == "GET" || method == "POST") && (path == "/api/status" || path == "/health") {
+        let all: Vec<StatusResponse> = collect_all_statuses()
+            .await
+            .into_iter()
+            .map(|(st, _)| st)
+            .collect();
+        let Some((primary, _)) = resolve_worker(selector).await else {
+            return json_error(404, "No matching ZapFast account found");
         };
+        let res = GlobalStatusResponse {
+            account_id: primary.account_id,
+            active: primary.active,
+            connected: primary.connected,
+            status: primary.status,
+            me_pn: primary.me_pn,
+            me_name: primary.me_name,
+            archive_path: primary.archive_path,
+            accounts: all,
+        };
+        return json_ok(&res);
     }
 
     if method != "POST" {
         return json_error(405, "Method not allowed");
     }
 
+    let Some((_, tx)) = resolve_worker(selector).await else {
+        return json_error(404, "Requested WhatsApp account not found in ZapFast");
+    };
     match path {
         "/api/chats" => {
             let Ok(req) = serde_json::from_slice::<ListChatsRequest>(body) else {
@@ -485,10 +666,13 @@ impl Worker {
         match cmd {
             McpCommand::Status { reply } => {
                 let _ = reply.send(StatusResponse {
+                    account_id: self.dirs.id.as_str().to_owned(),
+                    active: false,
                     connected: self.status.is_connected(),
                     status: self.status.log_label().to_owned(),
                     me_pn: self.me_pn.clone(),
                     me_name: self.me_name.clone(),
+                    archive_path: self.dirs.archive_db().to_string_lossy().into_owned(),
                 });
             }
             McpCommand::ListChats { req, reply } => {

@@ -1106,7 +1106,7 @@ pub async fn run(
     discard_attachment_staging(&worker.dirs.saved_sticker_dir());
     worker.start_bot().await;
     let mut wa_events = wa_events;
-    let mut mcp_inbox = mcp::spawn_server();
+    let mut mcp_inbox = mcp::spawn_server(worker.dirs.id.as_str().to_owned());
     let mut tick = tokio::time::interval(link_watch::CHECK_INTERVAL);
     'commands: loop {
         let deadline = worker.sync_deadline;
