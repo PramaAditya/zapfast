@@ -205,6 +205,9 @@ fn run() -> eframe::Result<()> {
     // update helper when asked (`--apply-update <job>`, then exit), and take
     // `--update-receipt` and `--update-error` off the command line.
     let launch = fastframe_update::intercept(&zapfast::updates::CONFIG);
+    if launch.arguments.get(1).and_then(|a| a.to_str()) == Some("mcp") {
+        return zapfast::mcp::run_stdio();
+    }
     let cli = Cli::parse_from(&launch.arguments);
     let discovered = paths::AppDirs::discover();
     // A control command only talks to the running copy: whatever the answer,

@@ -954,6 +954,18 @@ impl Archive {
         }
         Ok(out)
     }
+
+    /// Opens an existing encrypted archive in query-only mode using its OS keyring key.
+    pub fn mcp_open_readonly(path: &std::path::Path) -> anyhow::Result<Self> {
+        let key = super::encryption::key_for(path)?;
+        let connection = match super::encryption::read_only(path, &key) {
+            Ok(conn) => conn,
+            Err(_) => super::encryption::open(path, &key)?,
+        };
+        let _ = connection.busy_timeout(std::time::Duration::from_secs(2));
+        let _ = connection.pragma_update(None, "query_only", true);
+        Ok(Self { connection })
+    }
 }
 
 #[cfg(test)]

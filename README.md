@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/2bf86b54-45fc-4add-8de7-c426c3cdad9b
 
 </details>
 
-[Features](#your-chats-on-your-desktop) · [MCP & Localhost Bridge](#mcp--localhost-http--sse-bridge-fork-additions) · [Install](#install) · [Link your phone](#link-your-phone) · [Help](#guides-and-help)
+[Features](#your-chats-on-your-desktop) · [Native MCP & Localhost API](#native-mcp-server--localhost-http--sse-api) · [Install](#install) · [Link your phone](#link-your-phone) · [Help](#guides-and-help)
 
 ## Your chats, on your desktop
 
@@ -59,21 +59,28 @@ https://github.com/user-attachments/assets/2bf86b54-45fc-4add-8de7-c426c3cdad9b
 | **Privacy** | Hide locked chats behind a code, or the whole window behind an app lock. Nothing goes to a server of ours. |
 
 
-## MCP & Localhost HTTP + SSE Bridge (Fork Additions)
+## Native MCP Server & Localhost HTTP + SSE API
 
-This fork (`PramaAditya/zapfast`) embeds a zero-dependency **Localhost HTTP + Server-Sent Events (SSE) Bridge** on `127.0.0.1:47120` (`ZAPFAST_MCP_PORT` override supported) and pairs with `whatsapp-mcp-server` so AI agents (`omp`, Claude Desktop, Cursor) and local automation scripts share **one linked WhatsApp session** and **one encrypted SQLCipher database (`archive.db`)** with the desktop UI.
+This fork (`PramaAditya/zapfast`) includes a built-in, zero-dependency **Model Context Protocol (MCP) Server** (`zapfast mcp` over `stdio` JSON-RPC 2.0) and a **Localhost HTTP + Server-Sent Events (SSE) API** on `127.0.0.1:47120` (`ZAPFAST_MCP_PORT` override supported).
+
+Both the desktop UI and the MCP server run from the **same `zapfast` binary**, sharing a single linked WhatsApp companion session and a single SQLCipher-encrypted database (`archive.db` + `archive.db-wal`) per account.
 
 ```mermaid
 flowchart LR
-    subgraph ZapFast["zapfast.exe (Single Linked Device, Multi-Account)"]
-        UI["Native egui Desktop UI"]
-        W1["Account 1 Worker"]
-        W2["Account N Worker"]
-        Router["Localhost Bridge Router\n127.0.0.1:47120 (HTTP + SSE)"]
-        W1 <--> Router
-        W2 <--> Router
-        UI <--> W1
-        UI <--> W2
+    subgraph Binary["zapfast (Single Native Rust Binary)"]
+        subgraph GUI["Desktop Mode (`zapfast`)"]
+            UI["Native egui Desktop UI"]
+            W1["Account 1 Worker"]
+            W2["Account N Worker"]
+            Router["Localhost HTTP + SSE Router\n127.0.0.1:47120"]
+            W1 <--> Router
+            W2 <--> Router
+            UI <--> W1
+            UI <--> W2
+        end
+        subgraph Stdio["MCP Mode (`zapfast mcp`)"]
+            MCP["JSON-RPC 2.0 Stdio Server\n(19 Built-In Tools)"]
+        end
     end
 
     subgraph Storage["Local Encrypted Storage"]
@@ -82,32 +89,80 @@ flowchart LR
     end
 
     subgraph Clients["AI Agents & Local Scripts"]
-        MCP["whatsapp-mcp-server\n(In-Memory CNG Decryptor + FastMCP)"]
-        Scripts["Custom Watchers / Scripts\n(SSE /api/events + REST)"]
+        Agent["AI Agents (omp, Claude, Cursor)"]
+        Scripts["Local Watchers / Scripts\n(SSE /api/events + REST)"]
     end
 
+    Agent <== "stdio JSON-RPC 2.0" ==> MCP
     W1 --> DB
     W1 --> Media
-    DB -. "Zero-Lock In-Memory Decrypt (~1.2 ms)\n(Works even when ZapFast is closed)" .-> MCP
-    MCP -- "Write / Download Actions" --> Router
+    DB -. "Query-Only SQLCipher Read\n(Works even when GUI is closed)" .-> MCP
+    MCP -- "Write / Download / Auto-Wake (--start-hidden)" --> Router
     Router -- "SSE Real-Time Stream" --> Scripts
 ```
 
-### Why Single-Device Integration?
+### Key Capabilities
 
-| Capability | Legacy Standalone `whatsapp-bridge` (Go) | `PramaAditya/zapfast` MCP Bridge |
-|---|---|---|
-| **Linked WhatsApp Devices** | Requires a separate linked device (`whatsmeow`) | **1 shared linked device** with your desktop app |
-| **Local Message Database** | Duplicate unencrypted `store/messages.db` | **Single SQLCipher 4 `archive.db` + `archive.db-wal`** |
-| **Offline Read Access** | Fails if `bridge.exe` is not running | **Works even when ZapFast is closed** (in-memory AES-256-CBC decryption via Windows CNG + OS Keyring) |
-| **Multi-Account Support** | Single account only | **Full multi-account routing** (`accounts.json` discovery, SHA-256 per-folder keyring lookup, `account` selector by ID, phone, or name) |
-| **LID (`@lid`) & Contact Resolution** | Raw `@lid` JIDs often unresolved in groups | **Automatic `@lid` <-> `@s.whatsapp.net` & contact/push-name resolution** |
-| **Sent Messages in Desktop UI** | Invisible in desktop client until resync | **Appears instantaneously** in ZapFast UI |
-| **Auto-Update Safety** | N/A | **Auto-updater disabled** so custom binary is never overwritten |
+| Capability | Architecture |
+|---|---|
+| **Single-Binary Native MCP (`zapfast mcp`)** | Pure Rust JSON-RPC 2.0 `stdio` server built directly into `zapfast`; no external runtime, Python, or Node.js required |
+| **Offline & Live Read Access** | Reads `archive.db` + `archive.db-wal` directly in query-only SQLCipher mode via the OS keyring (`< 1 ms`), working even when the desktop window is closed |
+| **Auto-Wake for Outgoing Actions** | Calling a send or media-download tool when ZapFast is closed automatically launches `zapfast --start-hidden` in the background |
+| **Multi-Account Support** | Discovers all accounts in `accounts.json`, unlocks each account's dedicated keyring entry, and accepts an optional `account` selector (ID `"1"`/`"2"`, phone number, or account name) on every tool and endpoint |
+| **Automatic `@lid` & Contact Resolution** | Transparently maps WhatsApp privacy IDs (`@lid`) to canonical phone JIDs (`@s.whatsapp.net`) and contact/push names across direct and group chats |
+| **Real-Time SSE Event Stream (`GET /api/events`)** | Zero-overhead broadcast stream for incoming messages, edits, revokes, typing indicators, presence, calls, and link status |
+
+### MCP Configuration (`zapfast mcp`)
+
+#### `omp` (`~/.omp/agent/config.yml`)
+```yaml
+mcpServers:
+  whatsapp-mcp:
+    command: C:/Users/<you>/AppData/Local/Programs/ZapFast/zapfast.exe
+    args:
+      - mcp
+```
+
+#### Claude Desktop / Cursor (`claude_desktop_config.json` / `mcp.json`)
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\ZapFast\\zapfast.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Built-In MCP Tools (19 Tools)
+
+All tools accept an optional `account` parameter (`"1"`, `"2"`, phone number, or account name).
+
+| Tool | Description |
+|---|---|
+| `list_accounts` | List all configured WhatsApp accounts with `account_id`, `phone_number`, `name`, `active`, `connected`, and `archive_path` |
+| `list_chats` | List chats with last message and state metadata (`is_archived`, `is_pinned`, `unread_count`, `is_muted`, `is_locked`, `kind`); filter by `query`, `archived`, `unread_only`, `chat_type` |
+| `get_chat` | Get single chat metadata by JID or phone number |
+| `get_direct_chat_by_contact` | Find a direct chat by phone number |
+| `search_contacts` | Search contacts and direct chats by name or phone number |
+| `get_contact_chats` | List all direct and group chats involving a contact |
+| `get_last_interaction` | Get the most recent message involving a contact |
+| `list_messages` | Search and filter messages (`after`, `before`, `sender_phone_number`, `chat_jid`, `query`, `include_context`) |
+| `get_message_context` | Get surrounding messages immediately before and after `message_id` |
+| `get_group_info` | Get group metadata, description, admin flags, and full participant list with resolved phone numbers and names |
+| `query_archive` | Execute a read-only SQL query (`SELECT` / `WITH` / `PRAGMA`) against `archive.db` |
+| `send_message` | Send text to a contact or group, with optional `reply_to` (quote bubble) and `mentions` (`@mention` array) |
+| `send_file` | Send an image, video, audio file, or document (`caption`, `reply_to`, `as_document`, `view_once`) |
+| `send_audio_message` | Send an audio file as a WhatsApp voice note (`reply_to` supported) |
+| `send_poll` | Create and send a native WhatsApp poll (`chat_jid`, `question`, `options`, `multiple`) |
+| `react_message` | React to a message with an emoji (or `""` to remove reaction) |
+| `edit_message` | Edit a previously sent text message |
+| `revoke_message` | Revoke (delete for everyone) a previously sent message |
+| `chat_action` | Trigger `typing`, `stop_typing`, `mark_read`, `mark_unread`, `archive`, `unarchive`, `pin`, `unpin`, `mute`, or `unmute` |
+| `download_media` | Return cached attachment path or download media from WhatsApp (with phone re-upload fallback) |
 
 ### HTTP & SSE Endpoints (`http://127.0.0.1:47120`)
-
-All endpoints accept an optional `"account"` selector (`"1"`, `"2"`, phone number `"628..."`, or account name) in the JSON body or `?account=` query parameter. When omitted, requests automatically target the active account in `accounts.json`.
 
 | Method & Path | Description | Key Parameters / Filters |
 |---|---|---|
