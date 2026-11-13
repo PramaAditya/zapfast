@@ -1,19 +1,66 @@
-//! Localhost HTTP bridge (127.0.0.1:47120) exposing Archive reads and Worker actions for whatsapp-mcp.
+//! Localhost HTTP + SSE bridge (127.0.0.1:47120) exposing Archive reads, real-time events, and Worker actions.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use super::{FileSendOptions, Worker};
-use crate::archive::{McpChat, McpContact, McpMessage, McpMessageContext};
+use crate::archive::{
+    McpChat, McpContact, McpGroupInfo, McpMessage, McpMessageContext, mcp_describe_content,
+};
+use crate::backend::{Command, Event};
+use crate::model::{ChatActivity, PollDraft, ReplyTarget};
 use crate::paths::AppDirs;
+
 const DEFAULT_MCP_PORT: u16 = 47_120;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+static EVENT_BUS: LazyLock<broadcast::Sender<McpSseEvent>> =
+    LazyLock::new(|| broadcast::channel(512).0);
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct McpSseEvent {
+    pub event: String,
+    pub account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_pn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_jid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_muted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_jid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_me: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_path: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
 
 pub(super) enum McpCommand {
     Status {
@@ -51,9 +98,41 @@ pub(super) enum McpCommand {
         req: GetMessageContextRequest,
         reply: oneshot::Sender<Result<Option<McpMessageContext>, String>>,
     },
+    GetGroupInfo {
+        req: GetGroupInfoRequest,
+        reply: oneshot::Sender<Result<Option<McpGroupInfo>, String>>,
+    },
+    QuerySql {
+        req: QuerySqlRequest,
+        reply: oneshot::Sender<Result<Vec<serde_json::Value>, String>>,
+    },
     Send {
         req: SendMessageRequest,
         reply: oneshot::Sender<SendMessageResponse>,
+    },
+    React {
+        req: ReactRequest,
+        reply: oneshot::Sender<ActionResponse>,
+    },
+    Edit {
+        req: EditMessageRequest,
+        reply: oneshot::Sender<ActionResponse>,
+    },
+    Revoke {
+        req: RevokeMessageRequest,
+        reply: oneshot::Sender<ActionResponse>,
+    },
+    ChatAction {
+        req: ChatActionRequest,
+        reply: oneshot::Sender<ActionResponse>,
+    },
+    FetchOlder {
+        req: FetchOlderRequest,
+        reply: oneshot::Sender<ActionResponse>,
+    },
+    CreatePoll {
+        req: CreatePollRequest,
+        reply: oneshot::Sender<ActionResponse>,
     },
     Download {
         req: DownloadMediaRequest,
@@ -97,6 +176,7 @@ struct AccountsFile {
     #[serde(default)]
     pub order: Vec<String>,
 }
+
 #[derive(Deserialize)]
 pub(super) struct ListChatsRequest {
     pub query: Option<String>,
@@ -108,6 +188,12 @@ pub(super) struct ListChatsRequest {
     pub include_last_message: bool,
     #[serde(default = "default_sort_by")]
     pub sort_by: String,
+    #[serde(default)]
+    pub archived: Option<bool>,
+    #[serde(default)]
+    pub unread_only: bool,
+    #[serde(default)]
+    pub chat_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +252,16 @@ pub(super) struct GetMessageContextRequest {
 }
 
 #[derive(Deserialize)]
+pub(super) struct GetGroupInfoRequest {
+    pub chat_jid: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct QuerySqlRequest {
+    pub sql: String,
+}
+
+#[derive(Deserialize)]
 pub(super) struct SendMessageRequest {
     pub recipient: String,
     #[serde(default)]
@@ -174,12 +270,74 @@ pub(super) struct SendMessageRequest {
     pub media_path: String,
     #[serde(default)]
     pub is_voice: bool,
+    #[serde(default)]
+    pub as_document: bool,
+    #[serde(default)]
+    pub view_once: bool,
+    #[serde(default, alias = "reply_to_message_id")]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub mentions: Vec<String>,
 }
 
 #[derive(Serialize)]
 pub(super) struct SendMessageResponse {
     pub success: bool,
     pub message: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct ActionResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ReactRequest {
+    #[serde(default)]
+    pub chat_jid: Option<String>,
+    pub message_id: String,
+    #[serde(default)]
+    pub emoji: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EditMessageRequest {
+    #[serde(default)]
+    pub chat_jid: Option<String>,
+    pub message_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct RevokeMessageRequest {
+    #[serde(default)]
+    pub chat_jid: Option<String>,
+    pub message_id: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChatActionRequest {
+    pub chat_jid: String,
+    pub action: String,
+    #[serde(default)]
+    pub mute_until: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct FetchOlderRequest {
+    pub chat_jid: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreatePollRequest {
+    pub chat_jid: String,
+    pub question: String,
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub multiple: bool,
 }
 
 #[derive(Deserialize)]
@@ -369,8 +527,8 @@ async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
         return Ok(());
     }
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
+    let method = parts.next().unwrap_or("").to_owned();
+    let raw_path = parts.next().unwrap_or("").to_owned();
 
     let mut content_length = 0usize;
     loop {
@@ -392,7 +550,12 @@ async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     }
     let mut stream = reader.into_inner();
 
-    let (status, payload) = route_request(method, path, &body).await;
+    let base_path = raw_path.split('?').next().unwrap_or(&raw_path);
+    if method == "GET" && base_path == "/api/events" {
+        return serve_sse_stream(stream, &raw_path).await;
+    }
+
+    let (status, payload) = route_request(&method, &raw_path, &body).await;
     let status_text = match status {
         200 => "200 OK",
         400 => "400 Bad Request",
@@ -401,12 +564,187 @@ async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
         _ => "500 Internal Server Error",
     };
     let response = format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status_text}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     stream.write_all(response.as_bytes()).await?;
     stream.write_all(&payload).await?;
     stream.flush().await?;
+    Ok(())
+}
+
+fn url_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let raw = input.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'+' {
+            bytes.push(b' ');
+            i += 1;
+        } else if raw[i] == b'%'
+            && i + 2 < raw.len()
+            && let Ok(hex_str) = std::str::from_utf8(&raw[i + 1..i + 3])
+            && let Ok(val) = u8::from_str_radix(hex_str, 16)
+        {
+            bytes.push(val);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[derive(Default)]
+struct SseFilters {
+    account: Option<String>,
+    chat: Option<String>,
+    sender: Option<String>,
+    types: Vec<String>,
+    archived: Option<bool>,
+    from_me: Option<bool>,
+}
+
+impl SseFilters {
+    fn from_raw_path(raw_path: &str) -> Self {
+        let mut f = Self::default();
+        let Some((_, query)) = raw_path.split_once('?') else {
+            return f;
+        };
+        for pair in query.split('&') {
+            let Some((k, raw_v)) = pair.split_once('=') else {
+                continue;
+            };
+            let v = url_decode(raw_v).trim().to_owned();
+            if v.is_empty() {
+                continue;
+            }
+            match k {
+                "account" => f.account = Some(v.to_ascii_lowercase()),
+                "chat" => f.chat = Some(v.to_ascii_lowercase()),
+                "sender" => f.sender = Some(v.to_ascii_lowercase()),
+                "type" | "types" | "event" => {
+                    for item in v.split(',') {
+                        let t = item.trim().to_ascii_lowercase();
+                        if !t.is_empty() && t != "all" {
+                            f.types.push(t);
+                        }
+                    }
+                }
+                "archived" => {
+                    f.archived = match v.to_ascii_lowercase().as_str() {
+                        "1" | "true" | "yes" => Some(true),
+                        "0" | "false" | "no" => Some(false),
+                        _ => None,
+                    };
+                }
+                "from_me" | "include_from_me" => {
+                    f.from_me = match v.to_ascii_lowercase().as_str() {
+                        "1" | "true" | "yes" => Some(true),
+                        "0" | "false" | "no" => Some(false),
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
+        }
+        f
+    }
+
+    fn matches(&self, ev: &McpSseEvent) -> bool {
+        if !self.types.is_empty() && !self.types.iter().any(|t| t == &ev.event) {
+            return false;
+        }
+        if let Some(acct) = &self.account {
+            let id_match = ev.account_id.to_ascii_lowercase() == *acct;
+            let pn_match = ev
+                .account_pn
+                .as_deref()
+                .is_some_and(|p| p.to_ascii_lowercase().contains(acct));
+            if !id_match && !pn_match {
+                return false;
+            }
+        }
+        if let Some(arch) = self.archived
+            && ev.is_archived.is_some_and(|a| a != arch)
+        {
+            return false;
+        }
+        if let Some(fm) = self.from_me
+            && ev.from_me.is_some_and(|f| f != fm)
+        {
+            return false;
+        }
+        if let Some(chat_filter) = &self.chat {
+            let jid_ok = ev
+                .chat_jid
+                .as_deref()
+                .is_some_and(|j| j.to_ascii_lowercase().contains(chat_filter));
+            let name_ok = ev
+                .chat_name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains(chat_filter));
+            if !jid_ok && !name_ok {
+                return false;
+            }
+        }
+        if let Some(sender_filter) = &self.sender {
+            let jid_ok = ev
+                .sender_jid
+                .as_deref()
+                .is_some_and(|j| j.to_ascii_lowercase().contains(sender_filter));
+            let name_ok = ev
+                .sender_name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains(sender_filter));
+            if !jid_ok && !name_ok {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+async fn serve_sse_stream(mut stream: TcpStream, raw_path: &str) -> std::io::Result<()> {
+    let filters = SseFilters::from_raw_path(raw_path);
+    let mut rx = EVENT_BUS.subscribe();
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\nevent: ready\ndata: {\"status\":\"listening\"}\n\n";
+    stream.write_all(headers.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            res = rx.recv() => {
+                match res {
+                    Ok(ev) => {
+                        if !filters.matches(&ev) {
+                            continue;
+                        }
+                        if let Ok(json) = serde_json::to_string(&ev) {
+                            let frame = format!("event: {}\ndata: {json}\n\n", ev.event);
+                            if stream.write_all(frame.as_bytes()).await.is_err()
+                                || stream.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                if stream.write_all(b": keepalive\n\n").await.is_err()
+                    || stream.flush().await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -608,6 +946,34 @@ async fn route_request(method: &str, raw_path: &str, body: &[u8]) -> (u16, Vec<u
                 Err(_) => json_error(500, "Worker dropped request"),
             }
         }
+        "/api/group-info" => {
+            let Ok(req) = serde_json::from_slice::<GetGroupInfoRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::GetGroupInfo { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(Ok(info)) => json_ok(&info),
+                Ok(Err(err)) => json_error(500, err),
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/query" => {
+            let Ok(req) = serde_json::from_slice::<QuerySqlRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::QuerySql { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(Ok(rows)) => json_ok(&rows),
+                Ok(Err(err)) => json_error(400, err),
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
         "/api/send" => {
             let Ok(req) = serde_json::from_slice::<SendMessageRequest>(body) else {
                 return json_error(400, "Invalid request body");
@@ -619,6 +985,102 @@ async fn route_request(method: &str, raw_path: &str, body: &[u8]) -> (u16, Vec<u
             match rx.await {
                 Ok(res) => {
                     let status = if res.success { 200 } else { 500 };
+                    (status, serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/react" => {
+            let Ok(req) = serde_json::from_slice::<ReactRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::React { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(res) => {
+                    let status = if res.success { 200 } else { 500 };
+                    (status, serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/edit" => {
+            let Ok(req) = serde_json::from_slice::<EditMessageRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::Edit { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(res) => {
+                    let status = if res.success { 200 } else { 500 };
+                    (status, serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/revoke" => {
+            let Ok(req) = serde_json::from_slice::<RevokeMessageRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::Revoke { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(res) => {
+                    let status = if res.success { 200 } else { 500 };
+                    (status, serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/chat-action" => {
+            let Ok(req) = serde_json::from_slice::<ChatActionRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::ChatAction { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(res) => {
+                    let status = if res.success { 200 } else { 400 };
+                    (status, serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/fetch-older" => {
+            let Ok(req) = serde_json::from_slice::<FetchOlderRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::FetchOlder { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(res) => {
+                    let status = if res.success { 200 } else { 500 };
+                    (status, serde_json::to_vec(&res).unwrap_or_default())
+                }
+                Err(_) => json_error(500, "Worker dropped request"),
+            }
+        }
+        "/api/poll" => {
+            let Ok(req) = serde_json::from_slice::<CreatePollRequest>(body) else {
+                return json_error(400, "Invalid request body");
+            };
+            let (reply, rx) = oneshot::channel();
+            if tx.send(McpCommand::CreatePoll { req, reply }).is_err() {
+                return json_error(500, "Worker unavailable");
+            }
+            match rx.await {
+                Ok(res) => {
+                    let status = if res.success { 200 } else { 400 };
                     (status, serde_json::to_vec(&res).unwrap_or_default())
                 }
                 Err(_) => json_error(500, "Worker dropped request"),
@@ -684,6 +1146,9 @@ impl Worker {
                         req.page,
                         req.include_last_message,
                         &req.sort_by,
+                        req.archived,
+                        req.unread_only,
+                        req.chat_type.as_deref(),
                     )
                     .map_err(|e| e.to_string());
                 let _ = reply.send(res);
@@ -750,6 +1215,17 @@ impl Worker {
                     .map_err(|e| e.to_string());
                 let _ = reply.send(res);
             }
+            McpCommand::GetGroupInfo { req, reply } => {
+                let res = self
+                    .archive
+                    .mcp_get_group_info(&req.chat_jid)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(res);
+            }
+            McpCommand::QuerySql { req, reply } => {
+                let res = self.archive.mcp_query_readonly(&req.sql);
+                let _ = reply.send(res);
+            }
             McpCommand::Send { req, reply } => {
                 if self.connected_client().is_none() {
                     let _ = reply.send(SendMessageResponse {
@@ -775,6 +1251,21 @@ impl Worker {
                 let fallback_name = self.archive.mcp_sender_name(&chat, None);
                 let _ = self.archive.ensure_chat(&chat, &fallback_name);
 
+                let quoting = req
+                    .reply_to
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|id| ReplyTarget {
+                        id: id.to_owned(),
+                        chat: Some(chat.clone()),
+                    });
+                let mentions: Vec<String> = req
+                    .mentions
+                    .iter()
+                    .filter_map(|m| self.resolve_recipient_chat(m))
+                    .collect();
+
                 if !req.media_path.is_empty() {
                     let media_path = PathBuf::from(&req.media_path);
                     if !media_path.is_file() {
@@ -788,12 +1279,12 @@ impl Worker {
                         .extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("ogg"));
-                    if (req.is_voice || (is_ogg && req.message.is_empty()))
+                    if (req.is_voice || (is_ogg && req.message.is_empty() && !req.as_document))
                         && let Ok(bytes) = std::fs::read(&media_path)
                         && let Ok(samples) = crate::voice::decode(&bytes)
                     {
                         self.mcp_sends.entry(chat.clone()).or_default().push(reply);
-                        self.send_voice(chat, samples, None);
+                        self.send_voice(chat, samples, quoting);
                         return;
                     }
                     let caption = (!req.message.is_empty()).then_some(req.message);
@@ -802,17 +1293,169 @@ impl Worker {
                         chat,
                         vec![media_path],
                         FileSendOptions {
-                            documents: false,
-                            view_once: false,
+                            documents: req.as_document,
+                            view_once: req.view_once,
                         },
                         caption,
-                        Vec::new(),
-                        None,
+                        mentions,
+                        quoting,
                     );
                 } else {
                     self.mcp_sends.entry(chat.clone()).or_default().push(reply);
-                    self.send_text(chat, req.message, None, Vec::new(), None);
+                    self.send_text(chat, req.message, quoting, mentions, None);
                 }
+            }
+            McpCommand::React { req, reply } => {
+                let chat = self.resolve_chat_for_message(req.chat_jid.as_deref(), &req.message_id);
+                let Some(chat) = chat else {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: format!("Could not find chat for message {}", req.message_id),
+                    });
+                    return;
+                };
+                let _ = self.commands.send(Command::React {
+                    chat: chat.clone(),
+                    message: req.message_id.clone(),
+                    emoji: req.emoji.clone(),
+                });
+                let _ = reply.send(ActionResponse {
+                    success: true,
+                    message: format!("Reaction '{}' queued on {}", req.emoji, req.message_id),
+                });
+            }
+            McpCommand::Edit { req, reply } => {
+                let chat = self.resolve_chat_for_message(req.chat_jid.as_deref(), &req.message_id);
+                let Some(chat) = chat else {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: format!("Could not find chat for message {}", req.message_id),
+                    });
+                    return;
+                };
+                let mentions: Vec<String> = req
+                    .mentions
+                    .iter()
+                    .filter_map(|m| self.resolve_recipient_chat(m))
+                    .collect();
+                let _ = self.commands.send(Command::EditText {
+                    chat,
+                    id: req.message_id.clone(),
+                    text: req.text,
+                    mentions,
+                });
+                let _ = reply.send(ActionResponse {
+                    success: true,
+                    message: format!("Edit queued for message {}", req.message_id),
+                });
+            }
+            McpCommand::Revoke { req, reply } => {
+                let chat = self.resolve_chat_for_message(req.chat_jid.as_deref(), &req.message_id);
+                let Some(chat) = chat else {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: format!("Could not find chat for message {}", req.message_id),
+                    });
+                    return;
+                };
+                let _ = self.commands.send(Command::Revoke {
+                    chat,
+                    id: req.message_id.clone(),
+                });
+                let _ = reply.send(ActionResponse {
+                    success: true,
+                    message: format!("Revoke queued for message {}", req.message_id),
+                });
+            }
+            McpCommand::ChatAction { req, reply } => {
+                let Some(chat) = self.resolve_recipient_chat(&req.chat_jid) else {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: format!("Invalid chat_jid: {}", req.chat_jid),
+                    });
+                    return;
+                };
+                let action = req.action.trim().to_ascii_lowercase();
+                let cmd = match action.as_str() {
+                    "typing" | "composing" => Command::Composing {
+                        chat: chat.clone(),
+                        composing: true,
+                    },
+                    "stop_typing" | "paused" => Command::Composing {
+                        chat: chat.clone(),
+                        composing: false,
+                    },
+                    "mark_read" | "read" => Command::MarkRead {
+                        chat: chat.clone(),
+                        receipts: true,
+                    },
+                    "mark_unread" | "unread" => Command::MarkUnread(chat.clone()),
+                    "archive" => Command::SetArchived(chat.clone(), true),
+                    "unarchive" => Command::SetArchived(chat.clone(), false),
+                    "pin" => Command::SetPinned(chat.clone(), true),
+                    "unpin" => Command::SetPinned(chat.clone(), false),
+                    "mute" => Command::SetMuted(chat.clone(), Some(req.mute_until.unwrap_or(0))),
+                    "unmute" => Command::SetMuted(chat.clone(), None),
+                    other => {
+                        let _ = reply.send(ActionResponse {
+                            success: false,
+                            message: format!(
+                                "Unknown chat action '{other}'. Supported: typing, stop_typing, mark_read, mark_unread, archive, unarchive, pin, unpin, mute, unmute"
+                            ),
+                        });
+                        return;
+                    }
+                };
+                let _ = self.commands.send(cmd);
+                let _ = reply.send(ActionResponse {
+                    success: true,
+                    message: format!("Action '{action}' executed on {chat}"),
+                });
+            }
+            McpCommand::FetchOlder { req, reply } => {
+                let Some(chat) = self.resolve_recipient_chat(&req.chat_jid) else {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: format!("Invalid chat_jid: {}", req.chat_jid),
+                    });
+                    return;
+                };
+                let _ = self.commands.send(Command::FetchOlder {
+                    chat: chat.clone(),
+                    explicit: true,
+                });
+                let _ = reply.send(ActionResponse {
+                    success: true,
+                    message: format!("Requested older history from phone for {chat}"),
+                });
+            }
+            McpCommand::CreatePoll { req, reply } => {
+                let Some(chat) = self.resolve_recipient_chat(&req.chat_jid) else {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: format!("Invalid chat_jid: {}", req.chat_jid),
+                    });
+                    return;
+                };
+                if req.question.trim().is_empty() || req.options.len() < 2 {
+                    let _ = reply.send(ActionResponse {
+                        success: false,
+                        message: "Poll requires a question and at least 2 options".to_owned(),
+                    });
+                    return;
+                }
+                let _ = self.commands.send(Command::CreatePoll {
+                    chat: chat.clone(),
+                    draft: PollDraft {
+                        question: req.question,
+                        options: req.options,
+                        multiple: req.multiple,
+                    },
+                });
+                let _ = reply.send(ActionResponse {
+                    success: true,
+                    message: format!("Poll creation queued for {chat}"),
+                });
             }
             McpCommand::Download { req, reply } => {
                 let mut chat = if !req.chat_jid.trim().is_empty() {
@@ -932,5 +1575,267 @@ impl Worker {
             };
             let _ = reply.send(response);
         }
+    }
+
+    fn resolve_chat_for_message(
+        &self,
+        chat_hint: Option<&str>,
+        message_id: &str,
+    ) -> Option<String> {
+        if let Some(hint) = chat_hint.map(str::trim).filter(|s| !s.is_empty())
+            && let Some(resolved) = self.resolve_recipient_chat(hint)
+            && self
+                .archive
+                .message(&resolved, message_id)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return Some(resolved);
+        }
+        if let Ok(Some(found)) = self.archive.mcp_find_message_chat(message_id) {
+            return Some(found);
+        }
+        chat_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|h| self.resolve_recipient_chat(h))
+    }
+
+    pub(super) fn publish_mcp_event(&self, event: &Event) {
+        if EVENT_BUS.receiver_count() == 0 {
+            return;
+        }
+        let account_id = self.dirs.id.as_str().to_owned();
+        let account_pn = self.me_pn.clone();
+        let chat_meta = |chat_id: &str| {
+            let chat_row = self.archive.chat(chat_id).ok().flatten();
+            let name = chat_row
+                .as_ref()
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty())
+                .or_else(|| Some(self.archive.mcp_sender_name(chat_id, None)));
+            let kind = Some(
+                if chat_id.ends_with("@g.us") {
+                    "group"
+                } else if chat_id.ends_with("@newsletter") {
+                    "channel"
+                } else {
+                    "direct"
+                }
+                .to_owned(),
+            );
+            let is_archived = chat_row.as_ref().map(|c| c.archived);
+            let now_ts = crate::util::now();
+            let is_muted = chat_row
+                .as_ref()
+                .map(|c| c.muted_until.is_some_and(|m| m <= 0 || m > now_ts));
+            (name, kind, is_archived, is_muted)
+        };
+
+        let sse = match event {
+            Event::Incoming { chat, message } => {
+                let (chat_name, kind, is_archived, is_muted) = chat_meta(chat);
+                let (text, media_type, media_path) =
+                    mcp_describe_content(&message.content, message.quoted.as_ref());
+                let sender_name = if message.from_me {
+                    Some("Me".to_owned())
+                } else {
+                    Some(
+                        self.archive
+                            .mcp_sender_name(&message.sender, message.sender_name.as_deref()),
+                    )
+                };
+                let mentions = message.mentions.iter().map(|m| m.id.clone()).collect();
+                McpSseEvent {
+                    event: "incoming".to_owned(),
+                    account_id,
+                    account_pn,
+                    chat_jid: Some(chat.clone()),
+                    chat_name,
+                    kind,
+                    is_archived,
+                    is_muted,
+                    message_id: Some(message.id.clone()),
+                    sender_jid: Some(message.sender.clone()),
+                    sender_name,
+                    from_me: Some(message.from_me),
+                    timestamp: Some(message.timestamp),
+                    text: Some(text),
+                    media_type,
+                    media_path,
+                    mentions,
+                    detail: None,
+                }
+            }
+            Event::MessageUpdated(message) => {
+                let (chat_name, kind, is_archived, is_muted) = chat_meta(&message.chat);
+                let (text, media_type, media_path) =
+                    mcp_describe_content(&message.content, message.quoted.as_ref());
+                let sender_name = if message.from_me {
+                    Some("Me".to_owned())
+                } else {
+                    Some(
+                        self.archive
+                            .mcp_sender_name(&message.sender, message.sender_name.as_deref()),
+                    )
+                };
+                let mentions = message.mentions.iter().map(|m| m.id.clone()).collect();
+                McpSseEvent {
+                    event: "message_updated".to_owned(),
+                    account_id,
+                    account_pn,
+                    chat_jid: Some(message.chat.clone()),
+                    chat_name,
+                    kind,
+                    is_archived,
+                    is_muted,
+                    message_id: Some(message.id.clone()),
+                    sender_jid: Some(message.sender.clone()),
+                    sender_name,
+                    from_me: Some(message.from_me),
+                    timestamp: Some(message.timestamp),
+                    text: Some(text),
+                    media_type,
+                    media_path,
+                    mentions,
+                    detail: Some(if message.edited { "edited" } else { "updated" }.to_owned()),
+                }
+            }
+            Event::MessageDeleted { chat, id } => {
+                let (chat_name, kind, is_archived, is_muted) = chat_meta(chat);
+                McpSseEvent {
+                    event: "message_deleted".to_owned(),
+                    account_id,
+                    account_pn,
+                    chat_jid: Some(chat.clone()),
+                    chat_name,
+                    kind,
+                    is_archived,
+                    is_muted,
+                    message_id: Some(id.clone()),
+                    sender_jid: None,
+                    sender_name: None,
+                    from_me: None,
+                    timestamp: Some(crate::util::now()),
+                    text: None,
+                    media_type: None,
+                    media_path: None,
+                    mentions: Vec::new(),
+                    detail: None,
+                }
+            }
+            Event::Typing {
+                chat,
+                sender,
+                activity,
+            } => {
+                let (chat_name, kind, is_archived, is_muted) = chat_meta(chat);
+                let sender_name = Some(self.archive.mcp_sender_name(sender, None));
+                let detail = match activity {
+                    Some(ChatActivity::Typing) => "typing",
+                    Some(ChatActivity::Recording) => "recording",
+                    None => "stopped",
+                };
+                McpSseEvent {
+                    event: "typing".to_owned(),
+                    account_id,
+                    account_pn,
+                    chat_jid: Some(chat.clone()),
+                    chat_name,
+                    kind,
+                    is_archived,
+                    is_muted,
+                    message_id: None,
+                    sender_jid: Some(sender.clone()),
+                    sender_name,
+                    from_me: Some(false),
+                    timestamp: Some(crate::util::now()),
+                    text: None,
+                    media_type: None,
+                    media_path: None,
+                    mentions: Vec::new(),
+                    detail: Some(detail.to_owned()),
+                }
+            }
+            Event::Presence {
+                id,
+                online,
+                last_seen,
+            } => {
+                let sender_name = Some(self.archive.mcp_sender_name(id, None));
+                McpSseEvent {
+                    event: "presence".to_owned(),
+                    account_id,
+                    account_pn,
+                    chat_jid: Some(id.clone()),
+                    chat_name: sender_name.clone(),
+                    kind: Some("direct".to_owned()),
+                    is_archived: None,
+                    is_muted: None,
+                    message_id: None,
+                    sender_jid: Some(id.clone()),
+                    sender_name,
+                    from_me: None,
+                    timestamp: (*last_seen).or_else(|| Some(crate::util::now())),
+                    text: None,
+                    media_type: None,
+                    media_path: None,
+                    mentions: Vec::new(),
+                    detail: Some(if *online { "online" } else { "offline" }.to_owned()),
+                }
+            }
+            Event::Call(update) | Event::PhoneOnlyCall(update) => {
+                let (chat_name, kind, is_archived, is_muted) = chat_meta(&update.chat);
+                let detail = format!(
+                    "{}:{:?}",
+                    if update.video { "video" } else { "voice" },
+                    update.phase
+                )
+                .to_ascii_lowercase();
+                McpSseEvent {
+                    event: "call".to_owned(),
+                    account_id,
+                    account_pn,
+                    chat_jid: Some(update.chat.clone()),
+                    chat_name,
+                    kind,
+                    is_archived,
+                    is_muted,
+                    message_id: None,
+                    sender_jid: Some(update.chat.clone()),
+                    sender_name: None,
+                    from_me: None,
+                    timestamp: Some(crate::util::now()),
+                    text: None,
+                    media_type: None,
+                    media_path: None,
+                    mentions: Vec::new(),
+                    detail: Some(detail),
+                }
+            }
+            Event::Link(status) => McpSseEvent {
+                event: "status".to_owned(),
+                account_id,
+                account_pn,
+                chat_jid: None,
+                chat_name: None,
+                kind: None,
+                is_archived: None,
+                is_muted: None,
+                message_id: None,
+                sender_jid: None,
+                sender_name: None,
+                from_me: None,
+                timestamp: Some(crate::util::now()),
+                text: None,
+                media_type: None,
+                media_path: None,
+                mentions: Vec::new(),
+                detail: Some(status.log_label().to_owned()),
+            },
+            _ => return,
+        };
+        let _ = EVENT_BUS.send(sse);
     }
 }

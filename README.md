@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/2bf86b54-45fc-4add-8de7-c426c3cdad9b
 
 </details>
 
-[Features](#your-chats-on-your-desktop) · [Install](#install) · [Link your phone](#link-your-phone) · [Help](#guides-and-help)
+[Features](#your-chats-on-your-desktop) · [MCP & Localhost Bridge](#mcp--localhost-http--sse-bridge-fork-additions) · [Install](#install) · [Link your phone](#link-your-phone) · [Help](#guides-and-help)
 
 ## Your chats, on your desktop
 
@@ -58,6 +58,97 @@ https://github.com/user-attachments/assets/2bf86b54-45fc-4add-8de7-c426c3cdad9b
 | **Themes** | Choose light, dark, system appearance, or custom colours. On Omarchy, follow your desktop theme. |
 | **Privacy** | Hide locked chats behind a code, or the whole window behind an app lock. Nothing goes to a server of ours. |
 
+
+## MCP & Localhost HTTP + SSE Bridge (Fork Additions)
+
+This fork (`PramaAditya/zapfast`) embeds a zero-dependency **Localhost HTTP + Server-Sent Events (SSE) Bridge** on `127.0.0.1:47120` (`ZAPFAST_MCP_PORT` override supported) and pairs with `whatsapp-mcp-server` so AI agents (`omp`, Claude Desktop, Cursor) and local automation scripts share **one linked WhatsApp session** and **one encrypted SQLCipher database (`archive.db`)** with the desktop UI.
+
+```mermaid
+flowchart LR
+    subgraph ZapFast["zapfast.exe (Single Linked Device, Multi-Account)"]
+        UI["Native egui Desktop UI"]
+        W1["Account 1 Worker"]
+        W2["Account N Worker"]
+        Router["Localhost Bridge Router\n127.0.0.1:47120 (HTTP + SSE)"]
+        W1 <--> Router
+        W2 <--> Router
+        UI <--> W1
+        UI <--> W2
+    end
+
+    subgraph Storage["Local Encrypted Storage"]
+        DB[("archive.db + archive.db-wal\n(SQLCipher 4 + OS Keyring)")]
+        Media[("Local Media Cache")]
+    end
+
+    subgraph Clients["AI Agents & Local Scripts"]
+        MCP["whatsapp-mcp-server\n(In-Memory CNG Decryptor + FastMCP)"]
+        Scripts["Custom Watchers / Scripts\n(SSE /api/events + REST)"]
+    end
+
+    W1 --> DB
+    W1 --> Media
+    DB -. "Zero-Lock In-Memory Decrypt (~1.2 ms)\n(Works even when ZapFast is closed)" .-> MCP
+    MCP -- "Write / Download Actions" --> Router
+    Router -- "SSE Real-Time Stream" --> Scripts
+```
+
+### Why Single-Device Integration?
+
+| Capability | Legacy Standalone `whatsapp-bridge` (Go) | `PramaAditya/zapfast` MCP Bridge |
+|---|---|---|
+| **Linked WhatsApp Devices** | Requires a separate linked device (`whatsmeow`) | **1 shared linked device** with your desktop app |
+| **Local Message Database** | Duplicate unencrypted `store/messages.db` | **Single SQLCipher 4 `archive.db` + `archive.db-wal`** |
+| **Offline Read Access** | Fails if `bridge.exe` is not running | **Works even when ZapFast is closed** (in-memory AES-256-CBC decryption via Windows CNG + OS Keyring) |
+| **Multi-Account Support** | Single account only | **Full multi-account routing** (`accounts.json` discovery, SHA-256 per-folder keyring lookup, `account` selector by ID, phone, or name) |
+| **LID (`@lid`) & Contact Resolution** | Raw `@lid` JIDs often unresolved in groups | **Automatic `@lid` <-> `@s.whatsapp.net` & contact/push-name resolution** |
+| **Sent Messages in Desktop UI** | Invisible in desktop client until resync | **Appears instantaneously** in ZapFast UI |
+| **Auto-Update Safety** | N/A | **Auto-updater disabled** so custom binary is never overwritten |
+
+### HTTP & SSE Endpoints (`http://127.0.0.1:47120`)
+
+All endpoints accept an optional `"account"` selector (`"1"`, `"2"`, phone number `"628..."`, or account name) in the JSON body or `?account=` query parameter. When omitted, requests automatically target the active account in `accounts.json`.
+
+| Method & Path | Description | Key Parameters / Filters |
+|---|---|---|
+| `GET /api/events` | **Real-time Server-Sent Events (SSE)** stream for incoming messages, edits, revokes, typing, presence, calls, and link status (0% overhead when idle) | `?chat=`, `?sender=`, `?types=incoming,typing,presence,call,message_updated,message_deleted,status`, `?archived=true\|false`, `?from_me=true\|false`, `?account=` |
+| `GET /api/accounts` | List all linked WhatsApp accounts in ZapFast | Returns `account_id`, `active`, `connected`, `status`, `me_pn`, `me_name`, `archive_path` |
+| `GET /api/status` | Active or selected account status + full `accounts` array | `?account=` |
+| `POST /api/chats` | List chats with last message, archive/pin/mute/unread metadata | `query`, `limit`, `page`, `sort_by`, `archived` (`true`/`false`/`null`), `unread_only`, `chat_type` (`"direct"`/`"group"`), `account` |
+| `POST /api/chat` | Get single chat metadata by JID or phone | `chat_jid`, `include_last_message`, `account` |
+| `POST /api/direct-chat` | Find direct chat by phone number | `sender_phone_number`, `account` |
+| `POST /api/contacts` | Search contacts and direct chats | `query`, `account` |
+| `POST /api/contact-chats` | List all direct and group chats involving a contact | `jid`, `limit`, `page`, `account` |
+| `POST /api/last-interaction` | Most recent message involving a contact | `jid`, `account` |
+| `POST /api/messages` | Search and filter messages across chats | `after`, `before`, `sender_phone_number`, `chat_jid`, `query`, `limit`, `page`, `account` |
+| `POST /api/message-context` | Fetch messages before and after a target message ID | `message_id`, `chat_jid`, `before`, `after`, `account` |
+| `POST /api/group-info` | Fetch group metadata, description, admin flags, and resolved participants | `chat_jid`, `account` |
+| `POST /api/query` | Execute a read-only `SELECT` / `WITH` / `PRAGMA` SQL query on `archive.db` | `sql`, `account` |
+| `POST /api/send` | Send text, images, video, documents, view-once media, or Opus `.ogg` voice notes with **quote-reply** and **`@mentions`** | `recipient`, `message`, `media_path`, `is_voice`, `as_document`, `view_once`, `reply_to`, `mentions`, `account` |
+| `POST /api/react` | React to a message with an emoji (or `""` to remove reaction) | `message_id`, `emoji`, `chat_jid` (optional), `account` |
+| `POST /api/edit` | Edit a previously sent text message | `message_id`, `text`, `mentions` (optional), `chat_jid` (optional), `account` |
+| `POST /api/revoke` | Revoke (delete for everyone) a sent message | `message_id`, `chat_jid` (optional), `account` |
+| `POST /api/chat-action` | Trigger typing indicator or modify chat state | `chat_jid`, `action` (`typing`, `stop_typing`, `mark_read`, `mark_unread`, `archive`, `unarchive`, `pin`, `unpin`, `mute`, `unmute`), `mute_until`, `account` |
+| `POST /api/fetch-older` | Request older chat history from the linked phone on demand | `chat_jid`, `account` |
+| `POST /api/poll` | Create and send a native WhatsApp poll | `chat_jid`, `question`, `options`, `multiple`, `account` |
+| `POST /api/download` | Return cached attachment path or download from WhatsApp (with phone media re-upload fallback) | `message_id`, `chat_jid` (optional), `account` |
+
+### Quick Examples
+
+```bash
+# 1. Watch real-time incoming messages & typing events from a specific person or group (ignoring archived chats)
+curl -N "http://127.0.0.1:47120/api/events?chat=Nana&types=incoming,typing&archived=false"
+
+# 2. Send a quote-reply with @mentions
+curl -X POST http://127.0.0.1:47120/api/send \
+  -H "Content-Type: application/json" \
+  -d '{"recipient":"6289675224270@s.whatsapp.net","message":"Siap!","reply_to":"3EB053C9C8DA63B4531F0D"}'
+
+# 3. React to a message with an emoji
+curl -X POST http://127.0.0.1:47120/api/react \
+  -H "Content-Type: application/json" \
+  -d '{"message_id":"3EB053C9C8DA63B4531F0D","emoji":"👍"}'
+```
 ## Install
 
 | Platform | Installation |

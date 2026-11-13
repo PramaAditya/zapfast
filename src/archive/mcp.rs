@@ -1,11 +1,10 @@
 //! Read queries on the SQLCipher archive for the local MCP bridge.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, types::ValueRef};
 use serde::{Deserialize, Serialize};
 
 use super::{Archive, Result, SEARCHED_TEXT, search_pattern};
 use crate::model::{Content, Quoted};
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpMessage {
     pub id: String,
@@ -28,6 +27,12 @@ pub struct McpChat {
     pub last_message: Option<String>,
     pub last_sender: Option<String>,
     pub last_is_from_me: Option<bool>,
+    pub is_archived: bool,
+    pub is_pinned: bool,
+    pub unread_count: u32,
+    pub is_muted: bool,
+    pub is_locked: bool,
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,11 +49,31 @@ pub struct McpMessageContext {
     pub after: Vec<McpMessage>,
 }
 
-fn content_to_mcp(raw_json: &str) -> (String, Option<String>, Option<String>) {
-    let parsed: Content = serde_json::from_str(raw_json).unwrap_or(Content::Unsupported {
-        what: "unreadable".into(),
-    });
-    match &parsed {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpGroupParticipant {
+    pub jid: String,
+    pub phone_number: String,
+    pub name: Option<String>,
+    pub is_admin: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpGroupInfo {
+    pub jid: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub read_only: bool,
+    pub is_archived: bool,
+    pub is_muted: bool,
+    pub participant_count: usize,
+    pub participants: Vec<McpGroupParticipant>,
+}
+
+pub fn mcp_describe_content(
+    parsed: &Content,
+    quoted: Option<&Quoted>,
+) -> (String, Option<String>, Option<String>) {
+    let (raw_text, media_type, media_path) = match parsed {
         Content::Text { text, .. } | Content::Interactive { text, .. } => {
             (text.clone(), None, None)
         }
@@ -122,7 +147,26 @@ fn content_to_mcp(raw_json: &str) -> (String, Option<String>, Option<String>) {
                 .map(|p| p.to_string_lossy().into_owned()),
         ),
         other => (other.full_summary(), None, None),
-    }
+    };
+    let text = match quoted {
+        Some(q) if !q.summary.trim().is_empty() => {
+            let who = q
+                .sender_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&q.sender);
+            format!("> [Reply to {who}: {}]\n{raw_text}", q.summary)
+        }
+        _ => raw_text,
+    };
+    (text, media_type, media_path)
+}
+
+fn content_to_mcp(raw_json: &str) -> (String, Option<String>, Option<String>) {
+    let parsed: Content = serde_json::from_str(raw_json).unwrap_or(Content::Unsupported {
+        what: "unreadable".into(),
+    });
+    mcp_describe_content(&parsed, None)
 }
 
 fn format_with_quote(text: String, quoted_json: Option<&str>) -> String {
@@ -304,6 +348,21 @@ impl Archive {
         } else {
             (None, None, None, None)
         };
+        let archived: i64 = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
+        let pinned: i64 = row.get::<_, Option<i64>>(8)?.unwrap_or(0);
+        let unread: i64 = row.get::<_, Option<i64>>(9)?.unwrap_or(0);
+        let muted_until: Option<i64> = row.get(10)?;
+        let locked: i64 = row.get::<_, Option<i64>>(11)?.unwrap_or(0);
+        let kind: String = row.get::<_, Option<String>>(12)?.unwrap_or_else(|| {
+            if jid.ends_with("@g.us") {
+                "group"
+            } else {
+                "direct"
+            }
+            .to_owned()
+        });
+        let now_ts = crate::util::now();
+        let is_muted = muted_until.is_some_and(|m| m <= 0 || m > now_ts);
         let ts = last_msg_ts.unwrap_or(last_activity);
         Ok(McpChat {
             jid,
@@ -312,9 +371,16 @@ impl Archive {
             last_message,
             last_sender,
             last_is_from_me,
+            is_archived: archived != 0,
+            is_pinned: pinned != 0,
+            unread_count: unread.max(0) as u32,
+            is_muted,
+            is_locked: locked != 0,
+            kind,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mcp_list_chats(
         &self,
         query: Option<&str>,
@@ -322,15 +388,24 @@ impl Archive {
         page: usize,
         include_last_message: bool,
         sort_by: &str,
+        archived: Option<bool>,
+        unread_only: bool,
+        chat_type: Option<&str>,
     ) -> Result<Vec<McpChat>> {
         let pattern = query.and_then(search_pattern);
+        let archived_flag: Option<i64> = archived.map(i64::from);
+        let unread_flag: i64 = i64::from(unread_only);
+        let kind_filter: Option<String> = chat_type
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
         let order_by = if sort_by == "name" {
             "c.name ASC, c.last_activity DESC"
         } else {
             "c.last_activity DESC, c.name ASC"
         };
         let sql = format!(
-            "SELECT c.id, c.name, c.last_activity, m.content, m.sender, m.from_me, m.timestamp
+            "SELECT c.id, c.name, c.last_activity, m.content, m.sender, m.from_me, m.timestamp,
+                    c.archived, c.pinned, c.unread, c.muted_until, c.locked, c.kind
              FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
                  SELECT rowid FROM messages WHERE chat = c.id
@@ -339,14 +414,25 @@ impl Archive {
              )
              WHERE c.id != 'zapfast-call-link'
                AND (?1 IS NULL OR lower(c.name) LIKE ?1 ESCAPE '\\' OR lower(c.id) LIKE ?1 ESCAPE '\\')
+               AND (?2 IS NULL OR (?2 = 1 AND c.archived != 0) OR (?2 = 0 AND c.archived = 0))
+               AND (?3 = 0 OR c.unread != 0)
+               AND (?4 IS NULL OR lower(c.kind) = ?4)
              ORDER BY {order_by}
-             LIMIT ?2 OFFSET ?3"
+             LIMIT ?5 OFFSET ?6"
         );
         let mut stmt = self.connection.prepare(&sql)?;
         let offset = page.saturating_mul(limit);
-        let rows = stmt.query_map(params![pattern, limit as i64, offset as i64], |row| {
-            self.row_to_mcp_chat(row, include_last_message)
-        })?;
+        let rows = stmt.query_map(
+            params![
+                pattern,
+                archived_flag,
+                unread_flag,
+                kind_filter,
+                limit as i64,
+                offset as i64
+            ],
+            |row| self.row_to_mcp_chat(row, include_last_message),
+        )?;
         rows.collect()
     }
 
@@ -356,7 +442,8 @@ impl Archive {
         include_last_message: bool,
     ) -> Result<Option<McpChat>> {
         let candidates = self.mcp_resolve_jids(chat_jid);
-        let sql = "SELECT c.id, c.name, c.last_activity, m.content, m.sender, m.from_me, m.timestamp
+        let sql = "SELECT c.id, c.name, c.last_activity, m.content, m.sender, m.from_me, m.timestamp,
+                          c.archived, c.pinned, c.unread, c.muted_until, c.locked, c.kind
              FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
                  SELECT rowid FROM messages WHERE chat = c.id
@@ -396,7 +483,8 @@ impl Archive {
         let Some(pattern) = search_pattern(cleaned) else {
             return Ok(None);
         };
-        let sql = "SELECT c.id, c.name, c.last_activity, m.content, m.sender, m.from_me, m.timestamp
+        let sql = "SELECT c.id, c.name, c.last_activity, m.content, m.sender, m.from_me, m.timestamp,
+                          c.archived, c.pinned, c.unread, c.muted_until, c.locked, c.kind
              FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
                  SELECT rowid FROM messages WHERE chat = c.id
@@ -461,7 +549,8 @@ impl Archive {
         let like_primary = search_pattern(&primary).unwrap_or_default();
         let offset = page.saturating_mul(limit);
         let sql = "
-            SELECT c.id, c.name, c.last_activity, lm.content, lm.sender, lm.from_me, lm.timestamp
+            SELECT c.id, c.name, c.last_activity, lm.content, lm.sender, lm.from_me, lm.timestamp,
+                   c.archived, c.pinned, c.unread, c.muted_until, c.locked, c.kind
             FROM chats c
             LEFT JOIN messages lm ON lm.chat = c.id AND lm.rowid = (
                 SELECT rowid FROM messages WHERE chat = c.id
@@ -778,6 +867,93 @@ impl Archive {
             )
             .optional()
     }
+
+    pub fn mcp_get_group_info(&self, chat_jid: &str) -> Result<Option<McpGroupInfo>> {
+        let candidates = self.mcp_resolve_jids(chat_jid);
+        for candidate in candidates {
+            if let Some(chat) = self.chat(&candidate)? {
+                let admins = chat
+                    .group_settings
+                    .as_ref()
+                    .map(|g| g.admins.clone())
+                    .unwrap_or_default();
+                let mut participants = Vec::with_capacity(chat.participants.len());
+                for p in &chat.participants {
+                    let resolved = self.mcp_resolve_jids(p);
+                    let pn_jid = resolved
+                        .iter()
+                        .find(|r| r.ends_with("@s.whatsapp.net"))
+                        .cloned()
+                        .unwrap_or_else(|| p.clone());
+                    let phone_number = pn_jid.split('@').next().unwrap_or(&pn_jid).to_owned();
+                    let name_str = self.mcp_sender_name(p, None);
+                    let name = (name_str != *p && name_str != pn_jid).then_some(name_str);
+                    let is_admin = admins.iter().any(|a| a == p || a == &pn_jid);
+                    participants.push(McpGroupParticipant {
+                        jid: pn_jid,
+                        phone_number,
+                        name,
+                        is_admin,
+                    });
+                }
+                let now_ts = crate::util::now();
+                let is_muted = chat.muted_until.is_some_and(|m| m <= 0 || m > now_ts);
+                return Ok(Some(McpGroupInfo {
+                    jid: chat.id,
+                    name: chat.name,
+                    description: chat.group_description,
+                    read_only: chat.read_only,
+                    is_archived: chat.archived,
+                    is_muted,
+                    participant_count: participants.len(),
+                    participants,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn mcp_query_readonly(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Vec<serde_json::Value>, String> {
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            return Err("SQL query is empty".to_owned());
+        }
+        let mut stmt = self
+            .connection
+            .prepare(trimmed)
+            .map_err(|e| e.to_string())?;
+        if !stmt.readonly() {
+            return Err("Only read-only SELECT/WITH/PRAGMA queries are permitted".to_owned());
+        }
+        let col_names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let mut obj = serde_json::Map::with_capacity(col_names.len());
+            for (idx, col) in col_names.iter().enumerate() {
+                let val = match row.get_ref(idx).map_err(|e| e.to_string())? {
+                    ValueRef::Null => serde_json::Value::Null,
+                    ValueRef::Integer(i) => serde_json::Value::from(i),
+                    ValueRef::Real(f) => serde_json::Value::from(f),
+                    ValueRef::Text(bytes) => {
+                        serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+                    }
+                    ValueRef::Blob(bytes) => {
+                        serde_json::Value::String(format!("<blob:{} bytes>", bytes.len()))
+                    }
+                };
+                obj.insert(col.clone(), val);
+            }
+            out.push(serde_json::Value::Object(obj));
+            if out.len() >= 1000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -862,7 +1038,7 @@ mod tests {
         assert!(resolved.contains(&"628123456789@s.whatsapp.net".to_owned()));
 
         let chats = archive
-            .mcp_list_chats(Some("budi"), 10, 0, true, "last_active")
+            .mcp_list_chats(Some("budi"), 10, 0, true, "last_active", None, false, None)
             .unwrap();
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].last_message.as_deref(), Some("Mantap sekali"));

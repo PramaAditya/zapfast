@@ -24,7 +24,10 @@ pub use favorites::Favorite;
 mod labels;
 pub use labels::{DEFAULT_COLOR, LABEL_LIMIT, NAME_LIMIT};
 pub mod mcp;
-pub use mcp::{McpChat, McpContact, McpMessage, McpMessageContext};
+pub use mcp::{
+    McpChat, McpContact, McpGroupInfo, McpGroupParticipant, McpMessage, McpMessageContext,
+    mcp_describe_content,
+};
 mod pins;
 pub use pins::{Pinned, Pinner};
 mod polls;

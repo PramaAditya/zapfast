@@ -1993,6 +1993,7 @@ impl Worker {
         {
             return;
         }
+        self.publish_mcp_event(&event);
         let _ = self.events.send(event);
         self.waker.wake();
     }
