@@ -276,7 +276,7 @@ pub(super) struct SendMessageRequest {
     pub view_once: bool,
     #[serde(default, alias = "reply_to_message_id")]
     pub reply_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub mentions: Vec<String>,
 }
 
@@ -307,7 +307,7 @@ pub(super) struct EditMessageRequest {
     pub chat_jid: Option<String>,
     pub message_id: String,
     pub text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub mentions: Vec<String>,
 }
 
@@ -343,7 +343,7 @@ pub(super) struct CreatePollRequest {
 #[derive(Deserialize)]
 pub(super) struct DownloadMediaRequest {
     pub message_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub chat_jid: String,
 }
 
@@ -355,6 +355,14 @@ pub(super) struct DownloadMediaResponse {
     pub filename: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn default_limit() -> usize {

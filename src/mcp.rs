@@ -666,7 +666,7 @@ impl McpState {
                     "recipient": recipient,
                     "message": message,
                     "reply_to": arg_str(args, "reply_to"),
-                    "mentions": args.get("mentions").and_then(Value::as_array),
+                    "mentions": args.get("mentions").and_then(Value::as_array).cloned().unwrap_or_default(),
                     "account": account,
                 });
                 let (_, resp) =
@@ -768,7 +768,7 @@ impl McpState {
                 let chat_jid = arg_str(args, "chat_jid");
                 let payload = json!({
                     "message_id": message_id,
-                    "chat_jid": chat_jid,
+                    "chat_jid": chat_jid.unwrap_or(""),
                     "account": account,
                 });
                 let (_, resp) =
