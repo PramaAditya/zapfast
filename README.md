@@ -250,8 +250,9 @@ curl -X POST http://127.0.0.1:47120/api/query \
 
 ## Build and Install
 
-- **Windows CI artifact:** Every push to `main` builds `zapfast.exe` (`x86_64-pc-windows-msvc`) via [GitHub Actions](.github/workflows/build-windows.yml). Download the `zapfast-windows-x64` artifact and place it in your preferred install path.
-- **From source (Windows, macOS, Linux):**
+- **Prebuilt binaries (Windows x64, macOS arm64, Linux x64):** Download the latest archive and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/PramaAditya/zapfast/releases/latest).
+- **Versioning:** Releases use `mcp-v<upstream>-<rev>` tags (for example `mcp-v0.21.1-1`), tracking the upstream ZapFast base version without modifying `Cargo.toml`.
+- **From source:**
   ```bash
   cargo build --locked --release --bin zapfast
   ```

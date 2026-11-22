@@ -1,0 +1,123 @@
+name: Release ZapFast-MCP
+
+on:
+  push:
+    tags:
+      - "mcp-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. mcp-v0.21.1-1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            archive: zip
+          - label: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          - label: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            archive: tar.gz
+    steps:
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev \
+            libpipewire-0.3-dev clang libclang-dev cmake perl
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-mcp-${{ matrix.label }}
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin zapfast
+
+      - name: Package release archive
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          pkg="zapfast-mcp-${TAG}-${{ matrix.label }}"
+          mkdir -p "release-dist/${pkg}"
+          cp "target/${{ matrix.target }}/release/zapfast${{ matrix.ext }}" "release-dist/${pkg}/"
+          cp README.md LICENSE "release-dist/${pkg}/"
+          cd release-dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "${pkg}.zip" "${pkg}"
+          else
+            tar -czf "${pkg}.tar.gz" "${pkg}"
+          fi
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.label }}
+          path: |
+            release-dist/*.zip
+            release-dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download all release archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "ZapFast-MCP $TAG" \
+              --generate-notes
+          fi
