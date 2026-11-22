@@ -814,8 +814,8 @@ fn plain_disc(size: usize) -> Vec<u8> {
             let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
             let index = (y * size + x) * 4;
             rgba[index] = 0;
-            rgba[index + 1] = 168;
-            rgba[index + 2] = 132;
+            rgba[index + 1] = 140;
+            rgba[index + 2] = 240;
             rgba[index + 3] = (coverage * 255.0) as u8;
         }
     }
@@ -828,10 +828,10 @@ pub fn tray_template_rgba(size: usize) -> Vec<u8> {
     // The flat mark at every size: a template has no room for shading.
     let mut rgba = render_mark(SMALL_MARK, size).unwrap_or_else(|| plain_disc(size));
     // The disc's green against the ink's says how much of a pixel is disc.
-    const INK: f32 = 14.0;
-    const DISC: f32 = 168.0;
+    const INK: f32 = 20.0;
+    const DISC: f32 = 240.0;
     for pixel in rgba.as_chunks_mut::<4>().0 {
-        let disc = ((f32::from(pixel[1]) - INK) / (DISC - INK)).clamp(0.0, 1.0);
+        let disc = ((f32::from(pixel[2]) - INK) / (DISC - INK)).clamp(0.0, 1.0);
         pixel[3] = (f32::from(pixel[3]) * disc).round() as u8;
         pixel[0] = 0;
         pixel[1] = 0;

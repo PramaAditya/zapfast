@@ -11,11 +11,11 @@
 </p>
 
 <p align="center">
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-native-00a884?style=flat-square" alt="Built with Rust"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-native-008cf0?style=flat-square" alt="Built with Rust"></a>
   <a href="#built-in-mcp-tools-20-tools"><img src="https://img.shields.io/badge/MCP_Tools-20-24292f?style=flat-square" alt="20 Built-in MCP Tools"></a>
-  <a href="#localhost-api--live-event-feed-12700147120"><img src="https://img.shields.io/badge/Local_API-REST_%2B_Live_Feed-0969da?style=flat-square" alt="Localhost API and Live Event Feed"></a>
+  <a href="#localhost-api--live-event-feed-12700147120"><img src="https://img.shields.io/badge/Local_API-REST_%2B_Live_Feed-0070c9?style=flat-square" alt="Localhost API and Live Event Feed"></a>
   <a href="#build-and-install"><img src="https://img.shields.io/badge/Platform-Windows_%C2%B7_macOS_%C2%B7_Linux-24292f?style=flat-square" alt="Windows, macOS, and Linux"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-00a884?style=flat-square" alt="MIT License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-008cf0?style=flat-square" alt="MIT License"></a>
 </p>
 
 > [!WARNING]
