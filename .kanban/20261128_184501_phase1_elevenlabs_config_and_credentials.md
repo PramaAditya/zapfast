@@ -1,8 +1,9 @@
 ---
 title: "Phase 1: ElevenLabs Configuration & Secure Credentials"
-status: todo
+status: done
 priority: high
 created_at: 2026-11-28T18:45:01+07:00
+completed_at: 2026-11-28T20:05:00+07:00
 tags:
   - phase-1
   - settings
@@ -19,7 +20,7 @@ tags:
 - **Non-Secret Settings (`src/settings.rs`):** Persist `AiCallSettings` (`agent_id`, `live_monitor_default: bool`, `max_call_duration_secs`, `default_pitch_context`, `default_calendar_link`) with `#[serde(default)]` for full backward compatibility with existing settings files.
 
 ## Checklist
-- [ ] **Settings schema (`src/settings.rs`):** Add `AiCallSettings` struct with safe defaults (`live_monitor_default = true`, `max_call_duration_secs = 300`) and serde round-trip unit tests.
-- [ ] **Keyring helper (`src/ai_call/credentials.rs`):** Implement `load_api_key()`, `save_api_key()`, and `clear_api_key()` backed by `keyring_core` with `ELEVENLABS_API_KEY` env var fallback.
-- [ ] **Settings UI section (`src/ui/settings.rs`):** Add an "AI Voice Call (ElevenLabs)" panel with masked API key field, Agent ID input, default Live Monitor checkbox, max duration selector, and a "Test Connection" button (calls ElevenLabs signed-URL endpoint to validate credentials).
-- [ ] **Verification:** `cargo test` passes for settings backward compatibility and credential fallback logic.
+- [x] **Settings schema (`src/settings.rs`):** Added `AiCallSettings` struct with safe defaults (`live_monitor_default = true`, `max_call_duration_secs = 300`) and serde legacy/round-trip unit test.
+- [x] **Keyring helper (`src/ai_call/credentials.rs`):** Implemented `load_api_key()`, `save_api_key()`, `clear_api_key()`, and `test_connection()` backed by `keyring_core` with `ELEVENLABS_API_KEY` env var fallback.
+- [x] **Settings UI section (`src/ui/settings.rs`):** Added "AI Voice Call (ElevenLabs)" section with masked API key field + Save/Clear, Agent ID input, default Live Monitor toggle, max call duration selector, default calendar link, and non-blocking "Test connection" button.
+- [x] **Verification:** `cargo test --lib -j 8 ai_call` passed (4/4 tests, 0 Rust compiler warnings).

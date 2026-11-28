@@ -16,6 +16,7 @@ tags:
 
 ## Checklist
 - [ ] **Call safety guardrails:** Enforce configurable max AI call duration (auto wrap-up / hangup), minimum cooldown warning between outbound AI calls, and a first-run notice recommending a dedicated secondary/business number.
+- [ ] **Hard rate limiter & hourly quota (Gap #6):** Enforce configurable minimum cooldown between outbound AI calls (default 3-5 minutes) and an optional hourly outbound cap so operators cannot accidentally burn a WhatsApp number in one session.
 - [ ] **Mid-call disconnect recovery:** If the ElevenLabs WebSocket drops or returns an auth/quota error mid-call, display an immediate warning toast/banner on the call screen and highlight the **Takeover** button so the user can rescue the call seamlessly.
 - [ ] **Cold-call prompt pack:** Document reusable Indonesian and English ElevenLabs Agent system prompts tuned for concise B2B (Business-to-Business) meeting booking, polite objection handling, and natural handoff when the user clicks Takeover.
 - [ ] **End-to-end live test (self/secondary number):**

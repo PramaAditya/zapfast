@@ -21,6 +21,7 @@ tags:
 ## Checklist
 - [ ] **Model & App actions (`src/model.rs`, `src/app/calls.rs`):** Add `Action::StartAiCall { chat, prospect_name, company, note }`, `Action::SetAiMonitor(bool)`, and `Action::TakeoverAiCall` with optimistic UI feedback and backend routing.
 - [ ] **Chat header trigger (`src/ui/conversation.rs`):** Add an "AI Call" button (disabled with tooltip if ElevenLabs credentials/Agent ID are not configured) plus a lightweight pre-call modal to confirm/edit prospect name, company, and call objective before dialing.
+- [ ] **Cold vs Warm pre-call check (Gap #6):** Query `archive.db` message count for the target chat in the pre-call modal; if 0 prior messages (pure cold call), show a prominent red warning recommending an intro/permission chat message first.
 - [ ] **Live Call Screen (`src/ui/call.rs`):**
   - Status pill indicating AI vs Human state and speaking/listening activity.
   - **Live Monitor toggle button** (headphones/speaker icon) to mute/unmute local monitoring mid-call.

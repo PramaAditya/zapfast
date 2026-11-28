@@ -21,6 +21,9 @@ tags:
   - `HumanTakeover`: Immediately stops routing AI audio, closes/detaches the ElevenLabs WebSocket, routes physical `AudioInput` (with `FarEnd` echo cancellation intact) into `mic_rx`, and routes peer audio directly to `AudioOutput`.
 - **Live Monitor (`AtomicBool`):** When enabled during `AiActive`, both peer audio and AI outbound audio are mixed (clamped `i16`) into the local `AudioOutput` speaker stream so the user hears both sides in real time. Toggling Live Monitor OFF silences the local speaker without interrupting the AI call.
 
+- **Pre-Warmed Microphone for Zero-Lag Takeover (Gap #1):** Spawn `AudioInput` as soon as the call reaches `CallPhase::Active` (discarding mic frames while in `AiActive`, while keeping `FarEnd` fed with peer audio so AEC3 stays converged). Clicking Takeover then swaps the audio source in <10 ms with zero Windows WASAPI / Bluetooth open-device delay and no initial echo burst.
+- **Non-Blocking Tap & Drift-Free 60 ms Pacer (Gap #2):** Never block `output_tx` (whose `SPEAKER_QUEUE` is only 5 frames / ~300 ms) on ElevenLabs WebSocket writes. Use a non-blocking `try_send` tap into a bounded queue for the WS task while always feeding the local speaker mixer. Buffer inbound AI samples in a `VecDeque<i16>` carry-over buffer and drain exact 960-sample slices using `tokio::time::interval(Duration::from_millis(60))` (never `sleep`) to prevent clock drift and chunk-boundary clicks.
+- **Takeover Queue Flush (Gap #4):** Immediately clear the `VecDeque<i16>` pacer buffer on both `AiSessionEvent::Interrupt` and `HumanTakeover` so residual AI audio never collides with the human speaker.
 ```mermaid
 flowchart LR
     Peer[WhatsApp Peer VoIP] -->|output_tx 16kHz PCM| Router[Call Audio Bridge]
@@ -39,4 +42,6 @@ flowchart LR
 - [ ] **Zero-drop Takeover state machine:** Implement atomic transition `AiActive -> HumanTakeover` that swaps `mic_rx` to `AudioInput`, updates `FarEnd` echo cancellation, and shuts down the ElevenLabs task cleanly.
 - [ ] **Backend commands & events (`src/backend.rs`, `src/backend/worker/calls.rs`):** Add `Command::StartAiCall`, `Command::SetAiMonitor(bool)`, `Command::TakeoverAiCall`, and extend `CallUpdate` with `ai_state` (mode, monitor flag, AI speaking/listening status, latest transcript lines).
 - [ ] **Audio lifecycle parity:** Start the ElevenLabs session only when the call reaches `CallPhase::Active` (media relay ready) so the AI never talks into ringback tone; tear down immediately on `CallPhase::Ended`.
+- [ ] **Pre-warmed mic & FarEnd convergence:** Start `AudioInput` at `CallPhase::Active` (dropping frames during `AiActive` while feeding `FarEnd`) so Takeover has zero WASAPI/Bluetooth init delay and pre-converged AEC3.
+- [ ] **Non-blocking output_tx tap & VecDeque pacer:** Decouple `output_tx` from WS backpressure via `try_send` bounded queue; use `VecDeque<i16>` carry-over buffer + `tokio::time::interval(60 ms)` for click-free, drift-free 960-sample frames, flushing immediately on `Interrupt` or `Takeover`.
 - [ ] **Unit tests:** Verify 60 ms framing, interrupt flush drops queued AI frames immediately, Live Monitor mixing clamps cleanly without overflow, and Takeover switches source without closing `mic_rx`.

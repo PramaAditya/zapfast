@@ -548,6 +548,8 @@ pub struct Settings {
     pub window_y: Option<f32>,
     /// Whether the window was maximized when it last closed.
     pub window_maximized: bool,
+    /// Configuration for built-in ElevenLabs AI voice calls.
+    pub ai_call: AiCallSettings,
 }
 
 impl Default for Settings {
@@ -605,6 +607,39 @@ impl Default for Settings {
             window_x: None,
             window_y: None,
             window_maximized: false,
+            ai_call: AiCallSettings::default(),
+        }
+    }
+}
+
+/// Non-secret configuration for built-in ElevenLabs AI voice calls.
+///
+/// The ElevenLabs API key is stored in the OS keyring (or loaded from the
+/// `ELEVENLABS_API_KEY` environment variable) via `crate::ai_call::credentials`
+/// and is never written to `settings.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiCallSettings {
+    /// Default ElevenLabs Conversational AI Agent ID.
+    pub agent_id: String,
+    /// Play both peer and AI audio through local speakers during an AI call.
+    pub live_monitor_default: bool,
+    /// Maximum duration in seconds for an AI-driven call before auto wrap-up.
+    pub max_call_duration_secs: u32,
+    /// Optional default pitch or context passed as a dynamic variable.
+    pub default_pitch_context: String,
+    /// Optional default calendar booking link for post-call follow-up drafts.
+    pub default_calendar_link: String,
+}
+
+impl Default for AiCallSettings {
+    fn default() -> Self {
+        Self {
+            agent_id: String::new(),
+            live_monitor_default: true,
+            max_call_duration_secs: 300,
+            default_pitch_context: String::new(),
+            default_calendar_link: String::new(),
         }
     }
 }
@@ -1510,5 +1545,28 @@ mod giphy_tests {
             assert_eq!(limit.applies(false), direct, "{limit:?} for direct chats");
             assert_eq!(limit.applies(true), group, "{limit:?} for groups");
         }
+    }
+
+    #[test]
+    fn ai_call_settings_default_on_legacy_json_and_round_trip() {
+        let legacy: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(legacy.ai_call.live_monitor_default);
+        assert_eq!(legacy.ai_call.max_call_duration_secs, 300);
+        assert!(legacy.ai_call.agent_id.is_empty());
+
+        let configured = Settings {
+            ai_call: AiCallSettings {
+                agent_id: "agent_123".into(),
+                live_monitor_default: false,
+                max_call_duration_secs: 180,
+                default_pitch_context: "Book a 15-minute intro call".into(),
+                default_calendar_link: "https://cal.com/example/intro".into(),
+            },
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&configured).unwrap();
+        assert!(!json.contains("api_key"));
+        let parsed: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.ai_call, configured.ai_call);
     }
 }

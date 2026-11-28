@@ -790,6 +790,192 @@ fn sections(app: &App) -> Vec<Section> {
         },
     );
 
+    let mut ai_call = Section::new(translated(locale, "AI Voice Call (ElevenLabs)"));
+    ai_call.row(
+        translated(locale, "ElevenLabs API key"),
+        translated(
+            locale,
+            "Stored in your OS keyring (or ELEVENLABS_API_KEY env). Never written to settings.json.",
+        ),
+        move |ui, app| {
+            let draft_id = egui::Id::new("settings-elevenlabs-api-key-draft");
+            let status_id = egui::Id::new("settings-elevenlabs-api-key-status");
+            let mut draft = ui.data_mut(|data| {
+                data.get_temp::<String>(draft_id).unwrap_or_default()
+            });
+            let key_status = ui.data_mut(|data| {
+                data.get_temp::<String>(status_id).unwrap_or_else(|| {
+                    match crate::ai_call::credentials::load_api_key() {
+                        Ok(Some((_, crate::ai_call::credentials::ApiKeySource::Keyring))) => {
+                            "Saved in OS keyring".to_owned()
+                        }
+                        Ok(Some((_, crate::ai_call::credentials::ApiKeySource::EnvVar))) => {
+                            "Using ELEVENLABS_API_KEY env".to_owned()
+                        }
+                        Ok(None) => "Not configured".to_owned(),
+                        Err(err) => format!("Keyring error: {err}"),
+                    }
+                })
+            });
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut draft)
+                            .password(true)
+                            .hint_text("xi-...")
+                            .font(theme::regular(13.0))
+                            .text_color(palette.text)
+                            .desired_width(180.0),
+                    );
+                    if response.changed() {
+                        ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
+                    }
+                    if theme::soft_button(ui, &palette, None, "Save", false).clicked() {
+                        let next_status = match crate::ai_call::credentials::save_api_key(&draft) {
+                            Ok(()) => {
+                                draft.clear();
+                                ui.data_mut(|data| data.insert_temp(draft_id, draft));
+                                "Saved in OS keyring".to_owned()
+                            }
+                            Err(err) => format!("Save failed: {err}"),
+                        };
+                        ui.data_mut(|data| data.insert_temp(status_id, next_status));
+                    }
+                    if theme::soft_button(ui, &palette, None, "Clear", false).clicked() {
+                        let next_status = match crate::ai_call::credentials::clear_api_key() {
+                            Ok(()) => {
+                                ui.data_mut(|data| data.insert_temp(draft_id, String::new()));
+                                "Cleared from OS keyring".to_owned()
+                            }
+                            Err(err) => format!("Clear failed: {err}"),
+                        };
+                        ui.data_mut(|data| data.insert_temp(status_id, next_status));
+                    }
+                });
+                theme::text(ui, &key_status, theme::regular(11.5), palette.secondary);
+            });
+            let _ = app;
+        },
+    );
+    ai_call.row(
+        translated(locale, "Agent ID"),
+        translated(
+            locale,
+            "Default ElevenLabs Conversational AI Agent ID for outbound AI calls.",
+        ),
+        move |ui, app| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.settings.ai_call.agent_id)
+                    .hint_text("agent_...")
+                    .font(theme::regular(13.0))
+                    .text_color(palette.text)
+                    .desired_width(220.0),
+            );
+            if response.changed() {
+                app.actions.push(Action::SettingsChanged);
+            }
+        },
+    );
+    ai_call.toggle(
+        translated(locale, "Live Monitor by default"),
+        translated(
+            locale,
+            "Hear both the peer and the AI voice on your local speaker during AI calls.",
+        ),
+        |settings| &mut settings.ai_call.live_monitor_default,
+    );
+    ai_call.row(
+        translated(locale, "Max AI call duration"),
+        translated(
+            locale,
+            "Automatically wrap up an AI-driven call after this limit.",
+        ),
+        move |ui, app| {
+            ui.horizontal(|ui| {
+                for (secs, label) in [(120_u32, "2 min"), (180, "3 min"), (300, "5 min"), (600, "10 min")] {
+                    let selected = app.settings.ai_call.max_call_duration_secs == secs;
+                    if theme::soft_button(ui, &palette, None, label, selected).clicked() {
+                        app.settings.ai_call.max_call_duration_secs = secs;
+                        app.actions.push(Action::SettingsChanged);
+                    }
+                }
+            });
+        },
+    );
+    ai_call.row(
+        translated(locale, "Default calendar link"),
+        translated(
+            locale,
+            "Included in post-call WhatsApp follow-up drafts when a meeting is booked.",
+        ),
+        move |ui, app| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.settings.ai_call.default_calendar_link)
+                    .hint_text("https://cal.com/...")
+                    .font(theme::regular(13.0))
+                    .text_color(palette.text)
+                    .desired_width(220.0),
+            );
+            if response.changed() {
+                app.actions.push(Action::SettingsChanged);
+            }
+        },
+    );
+    ai_call.row(
+        translated(locale, "Test connection"),
+        translated(
+            locale,
+            "Verify that your API key and Agent ID can request a signed ElevenLabs session.",
+        ),
+        move |ui, app| {
+            let state_id = egui::Id::new("settings-elevenlabs-test-state");
+            let shared: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>> =
+                ui.data_mut(|data| {
+                    data.get_temp::<std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>>(
+                        state_id,
+                    )
+                    .unwrap_or_else(|| {
+                        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        data.insert_temp(state_id, std::sync::Arc::clone(&slot));
+                        slot
+                    })
+                });
+            ui.vertical(|ui| {
+                if theme::soft_button(ui, &palette, None, "Test connection", false).clicked() {
+                    let agent_id = app.settings.ai_call.agent_id.clone();
+                    let slot = std::sync::Arc::clone(&shared);
+                    let ctx = ui.ctx().clone();
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(Ok("Testing...".to_owned()));
+                    }
+                    std::thread::spawn(move || {
+                        let outcome = match crate::ai_call::credentials::load_api_key() {
+                            Ok(Some((key, _))) => {
+                                crate::ai_call::credentials::test_connection(&key, &agent_id)
+                                    .map_err(|err| err.to_string())
+                            }
+                            Ok(None) => Err("No ElevenLabs API key configured.".to_owned()),
+                            Err(err) => Err(err.to_string()),
+                        };
+                        if let Ok(mut guard) = slot.lock() {
+                            *guard = Some(outcome);
+                        }
+                        ctx.request_repaint();
+                    });
+                }
+                if let Ok(guard) = shared.lock()
+                    && let Some(result) = guard.as_ref()
+                {
+                    let (msg, color) = match result {
+                        Ok(ok) => (ok.as_str(), palette.accent),
+                        Err(err) => (err.as_str(), palette.danger),
+                    };
+                    theme::text(ui, msg, theme::regular(11.5), color);
+                }
+            });
+        },
+    );
+
     let mut account_section = Section::new(translated(locale, "Account"));
     account_section.block(
         vec![
@@ -910,6 +1096,7 @@ fn sections(app: &App) -> Vec<Section> {
         notifications,
         privacy,
         system,
+        ai_call,
         account_section,
         files,
         about_section,
